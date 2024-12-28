@@ -15,8 +15,6 @@ struct State<'a> {
     // must be declared after surface for some weird reason
     // https://sotrh.github.io/learn-wgpu/beginner/tutorial2-surface/
     window: &'a Window,
-
-    clear_color: [f64; 3],
 }
 
 impl<'a> State<'a> {
@@ -75,8 +73,6 @@ impl<'a> State<'a> {
             queue,
             config,
             size,
-            clear_color: [0.009021491898012131, 0.009021491898012131, 0.023103556157921437]
-
         }
     }
 
@@ -94,17 +90,7 @@ impl<'a> State<'a> {
     }
 
     fn input(&mut self, event: &WindowEvent) -> bool {
-        match event {
-            WindowEvent::CursorMoved { position, .. } => {
-                self.clear_color = [
-                    (position.x / (self.size.width as f64)).powf(2.2),
-                    (position.y / (self.size.width as f64)).powf(2.2),
-                    0.023103556157921437
-                ];
-                true
-            }
-            _ => false
-        }
+        false
     }
 
     fn update(&mut self) {
@@ -126,9 +112,9 @@ impl<'a> State<'a> {
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: self.clear_color[0],
-                        g: self.clear_color[1],
-                        b: self.clear_color[2],
+                        r: 0.009021491898012131,
+                        g: 0.009021491898012131,
+                        b: 0.023103556157921437,
                         a: 1.0,
                     }),
                     store: wgpu::StoreOp::Store,
