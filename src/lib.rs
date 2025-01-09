@@ -41,6 +41,10 @@ const INDICES: &[u16] = &[
     0, 1, 4,
     1, 2, 4,
     2, 3, 4,
+
+    4, 3, 2, 
+    4, 2, 1,
+    4, 1, 0,
 ];
 
 #[rustfmt::skip]
@@ -173,6 +177,24 @@ impl CameraController {
     }
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct AngleUniform {
+    rot_mat: [[f32; 4]; 4]
+}
+
+impl AngleUniform {
+    fn new(theta: f32) -> Self {
+        Self {
+            rot_mat: cgmath::Matrix4::from_angle_y(cgmath::Deg(theta)).into(),
+        }
+    }
+
+    fn update_angle(&mut self, theta: f32) {
+        self.rot_mat = cgmath::Matrix4::from_angle_y(cgmath::Deg(theta)).into();
+    }
+}
+
 struct State<'a> {
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
@@ -191,6 +213,13 @@ struct State<'a> {
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+
+    angle: f32,
+    angle_uniform: AngleUniform,
+    angle_buffer: wgpu::Buffer,
+    angle_bind_group: wgpu::BindGroup,
+
+    staging_buffer: wgpu::util::StagingBelt,
 
     // must be declared after surface for some weird reason
     // https://sotrh.github.io/learn-wgpu/beginner/tutorial2-surface/
@@ -296,7 +325,6 @@ impl<'a> State<'a> {
             }
         );
 
-
         let camera = Camera {
             eye: (0.0, 1.0, 2.0).into(),
             target: (0.0, 0.0, 0.0).into(),
@@ -347,6 +375,48 @@ impl<'a> State<'a> {
             ],
         });
 
+        let angle = 0.0;
+        let angle_uniform = AngleUniform::new(angle);
+
+        let angle_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Angle Buffer"),
+                contents: bytemuck::cast_slice(&[angle_uniform]),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            }
+        );
+
+        let angle_bind_group_layout = device.create_bind_group_layout(
+            &wgpu::BindGroupLayoutDescriptor {
+                label: Some("angle_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            }
+        );
+
+        let angle_bind_group = device.create_bind_group(
+            &wgpu::BindGroupDescriptor {
+                label: Some("angle_bind_group"),
+                layout: &angle_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: angle_buffer.as_entire_binding(),
+                    }
+                ],
+            }
+        );
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -360,6 +430,7 @@ impl<'a> State<'a> {
                 bind_group_layouts: &[
                     &texture_bind_group_layout,
                     &camera_bind_group_layout,
+                    &angle_bind_group_layout,
                 ],
                 push_constant_ranges: &[],
             });
@@ -425,6 +496,8 @@ impl<'a> State<'a> {
 
         let num_indices = INDICES.len() as u32;
 
+        let staging_buffer = wgpu::util::StagingBelt::new((2 * std::mem::size_of::<AngleUniform>()) as wgpu::BufferAddress);
+
 
         Self {
             surface,
@@ -438,11 +511,20 @@ impl<'a> State<'a> {
             num_indices,
             diffuse_bind_group,
             diffuse_texture,
+
             camera,
             camera_controller,
             camera_uniform,
             camera_buffer,
             camera_bind_group,
+
+            angle,
+            angle_uniform,
+            angle_buffer,
+            angle_bind_group,
+
+            staging_buffer,
+
             window,
         }
     }
@@ -468,6 +550,9 @@ impl<'a> State<'a> {
         self.camera_controller.update_camera(&mut self.camera);
         self.camera_uniform.update_view_proj(&self.camera);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
+
+        self.angle += 2.0;
+        self.angle_uniform.update_angle(self.angle);
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -502,6 +587,18 @@ impl<'a> State<'a> {
         render_pass.set_pipeline(&self.render_pipeline);
         render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
         render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
+        render_pass.set_bind_group(2, &self.angle_bind_group, &[]);
+
+        use std::num::NonZero;
+        let mut stage_encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Render Encoder")
+        });
+        // let buffer_size = NonZero::new(self.angle_buffer.size()).unwrap();
+        self.staging_buffer
+            .write_buffer(&mut stage_encoder, &self.angle_buffer, 0, NonZero::new(self.angle_buffer.size()).unwrap(), &self.device)
+            .copy_from_slice(bytemuck::cast_slice(&[self.angle_uniform]));
+
+        self.staging_buffer.finish();
 
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
@@ -511,6 +608,9 @@ impl<'a> State<'a> {
         drop(render_pass);
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        self.queue.submit(std::iter::once(stage_encoder.finish()));
+
+        self.staging_buffer.recall();
         output.present();
 
         Ok(())
