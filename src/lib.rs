@@ -1,4 +1,6 @@
 mod texture;
+mod model;
+mod resources;
 
 use winit::{
     event::*,
@@ -6,48 +8,10 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
     window::{WindowBuilder, Window},
 };
-
 use wgpu::util::DeviceExt;
-
 use cgmath::prelude::*;
+use model::Vertex;
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    position: [f32; 3],
-    tex_coords: [f32; 2],
-}
-
-impl Vertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 2] = 
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2];
-
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &Self::ATTRIBS,
-        }
-    }
-}
-
-const VERTICES: &[Vertex] = &[
-    Vertex { position: [-0.0868241 ,  0.49240386, 0.0], tex_coords: [0.4131759   , 1.-0.99240386], }, // A
-    Vertex { position: [-0.49513406,  0.06958647, 0.0], tex_coords: [0.0048659444, 1.-0.56958647], }, // B
-    Vertex { position: [-0.21918549, -0.44939706, 0.0], tex_coords: [0.28081453  , 1.-0.05060294], }, // C
-    Vertex { position: [ 0.35966998, -0.3473291 , 0.0], tex_coords: [0.85967     , 1.-0.1526709 ], }, // D
-    Vertex { position: [ 0.44147372,  0.2347359 , 0.0], tex_coords: [0.9414737   , 1.-0.7347359 ], }, // E
-];
-
-const INDICES: &[u16] = &[
-    0, 1, 4,
-    1, 2, 4,
-    2, 3, 4,
-
-    4, 3, 2, 
-    4, 2, 1,
-    4, 1, 0,
-];
 
 struct Instance {
     position: cgmath::Vector3<f32>,
@@ -276,9 +240,6 @@ struct State<'a> {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    num_indices: u32,
     diffuse_bind_group: wgpu::BindGroup,
     diffuse_texture: texture::Texture,
     depth_texture: texture::Texture,
@@ -295,6 +256,8 @@ struct State<'a> {
     angle_bind_group: wgpu::BindGroup,
 
     staging_buffer: wgpu::util::StagingBelt,
+
+    obj_model: model::Model,
 
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
@@ -495,9 +458,17 @@ impl<'a> State<'a> {
             }
         );
 
+        let obj_model = 
+            resources::load_model("cube.obj", &device, &queue, &texture_bind_group_layout)
+                .await
+                .unwrap();
+
+        const SPACE_BETWEEN: f32 = 3.0;
         let instances = (0..NUM_INSTANCES_PER_ROW).flat_map(|z| {
             (0..NUM_INSTANCES_PER_ROW).map(move |x| {
-                let position = cgmath::Vector3 {x: x as f32, y: 0.0, z: z as f32 } - INSTANCE_DISPLACEMENT;
+                let x = SPACE_BETWEEN * ((x as f32) - (NUM_INSTANCES_PER_ROW as f32) / 2.0);
+                let z = SPACE_BETWEEN * ((z as f32) - (NUM_INSTANCES_PER_ROW as f32) / 2.0);
+                let position = cgmath::Vector3 {x, y: 0.0, z };
 
                 /*
                 let rotation = if position.is_zero() {
@@ -550,7 +521,7 @@ impl<'a> State<'a> {
                 module: &shader,
                 entry_point: "vs_main",
                 buffers: &[
-                    Vertex::desc(),
+                    model::ModelVertex::desc(),
                     InstanceRaw::desc(),
                 ],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -593,24 +564,6 @@ impl<'a> State<'a> {
             cache: None
         });
 
-        let vertex_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: bytemuck::cast_slice(VERTICES),
-                usage: wgpu::BufferUsages::VERTEX,
-            }
-        );
-
-        let index_buffer = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label: Some("Index Buffer"),
-                contents: bytemuck::cast_slice(INDICES),
-                usage: wgpu::BufferUsages::INDEX,
-            }
-        );
-
-        let num_indices = INDICES.len() as u32;
-
         let staging_buffer = wgpu::util::StagingBelt::new((2 * std::mem::size_of::<AngleUniform>()) as wgpu::BufferAddress);
 
         Self {
@@ -620,9 +573,6 @@ impl<'a> State<'a> {
             config,
             size,
             render_pipeline,
-            vertex_buffer,
-            index_buffer,
-            num_indices,
             diffuse_bind_group,
             diffuse_texture,
             depth_texture,
@@ -639,6 +589,8 @@ impl<'a> State<'a> {
             angle_bind_group,
 
             staging_buffer,
+
+            obj_model,
 
             instances,
             instance_buffer,
@@ -727,11 +679,10 @@ impl<'a> State<'a> {
 
         self.staging_buffer.finish();
 
-        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-        render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
 
-        render_pass.draw_indexed(0..self.num_indices, 0, 0..self.instances.len() as _);
+        use model::DrawModel;
+        render_pass.draw_model_instanced(&self.obj_model, 0..self.instances.len() as u32);
 
         drop(render_pass);
 
