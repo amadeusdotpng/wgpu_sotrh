@@ -9,6 +9,8 @@ use winit::{
 
 use wgpu::util::DeviceExt;
 
+use cgmath::prelude::*;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
@@ -46,6 +48,77 @@ const INDICES: &[u16] = &[
     4, 2, 1,
     4, 1, 0,
 ];
+
+struct Instance {
+    position: cgmath::Vector3<f32>,
+    rotation: cgmath::Quaternion<f32>,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct InstanceRaw {
+    model: [[f32; 4]; 4],
+}
+
+impl Instance {
+    fn to_raw(&self) -> InstanceRaw {
+        InstanceRaw {
+            model: (cgmath::Matrix4::from_translation(self.position) * cgmath::Matrix4::from(self.rotation)).into()
+        }
+    }
+}
+
+impl InstanceRaw {
+    const ATTRIBS: [wgpu::VertexAttribute; 4] =
+        wgpu::vertex_attr_array![5 => Float32x4, 6 => Float32x4, 7 => Float32x4, 8 => Float32x4];
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        use std::mem;
+        wgpu::VertexBufferLayout {
+            array_stride: mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
+
+            // switch from step mode of Vertex to Instance
+            // shaders will only change to use the next instance
+            // when the shader starts processing a new instance
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::ATTRIBS,
+            /*
+            attributes: &[
+                // mat4 takes up 4 vertex slots bc it is techincally 4 vec4s.
+                // need to define a slot for each vec4 and reassemble the mat4 in the shader.
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    // later tutorials will be using 2, 3, and 4.
+                    // so we start at slot 5 to avoid conflicts
+                    shader_location: 5,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
+                    shader_location: 6,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
+                    shader_location: 7,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+                wgpu::VertexAttribute {
+                    offset: mem::size_of::<[f32; 12]>() as wgpu::BufferAddress,
+                    shader_location: 8,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+            */
+        }
+    }
+}
+
+const NUM_INSTANCES_PER_ROW: u32 = 10;
+const INSTANCE_DISPLACEMENT: cgmath::Vector3<f32> = cgmath::Vector3::new(
+        NUM_INSTANCES_PER_ROW as f32 * 0.5,
+        0.0,
+        NUM_INSTANCES_PER_ROW as f32 * 0.5
+);
 
 #[rustfmt::skip]
 pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
@@ -186,14 +259,15 @@ struct AngleUniform {
 impl AngleUniform {
     fn new(theta: f32) -> Self {
         Self {
-            rot_mat: cgmath::Matrix4::from_angle_y(cgmath::Deg(theta)).into(),
+            rot_mat: cgmath::Matrix4::from_angle_x(cgmath::Deg(theta)).into(),
         }
     }
 
     fn update_angle(&mut self, theta: f32) {
-        self.rot_mat = cgmath::Matrix4::from_angle_y(cgmath::Deg(theta)).into();
+        self.rot_mat = cgmath::Matrix4::from_angle_x(cgmath::Deg(theta)).into();
     }
 }
+
 
 struct State<'a> {
     surface: wgpu::Surface<'a>,
@@ -207,6 +281,7 @@ struct State<'a> {
     num_indices: u32,
     diffuse_bind_group: wgpu::BindGroup,
     diffuse_texture: texture::Texture,
+    depth_texture: texture::Texture,
 
     camera: Camera,
     camera_controller: CameraController,
@@ -220,6 +295,9 @@ struct State<'a> {
     angle_bind_group: wgpu::BindGroup,
 
     staging_buffer: wgpu::util::StagingBelt,
+
+    instances: Vec<Instance>,
+    instance_buffer: wgpu::Buffer,
 
     // must be declared after surface for some weird reason
     // https://sotrh.github.io/learn-wgpu/beginner/tutorial2-surface/
@@ -417,6 +495,36 @@ impl<'a> State<'a> {
             }
         );
 
+        let instances = (0..NUM_INSTANCES_PER_ROW).flat_map(|z| {
+            (0..NUM_INSTANCES_PER_ROW).map(move |x| {
+                let position = cgmath::Vector3 {x: x as f32, y: 0.0, z: z as f32 } - INSTANCE_DISPLACEMENT;
+
+                /*
+                let rotation = if position.is_zero() {
+                    // needed so object at (0, 0, 0) doesn't get scaled to zero as quaternions can
+                    // affect scal if they're not created correctly
+                    cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0))
+                } else {
+                    cgmath::Quaternion::from_axis_angle(position.normalize(), cgmath::Deg(45.0))
+                };
+                */
+                let rotation = cgmath::Quaternion::from_angle_y(cgmath::Deg((x as f32 / NUM_INSTANCES_PER_ROW as f32) * 90.0));
+                // let rotation = cgmath::Quaternion::from_angle_y(cgmath::Deg(0.0));
+
+                Instance { position, rotation }
+            })
+        }).collect::<Vec<Instance>>();
+
+        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<InstanceRaw>>();
+        let instance_buffer = device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Instance Buffer"),
+                contents: bytemuck::cast_slice(&instance_data),
+                usage: wgpu::BufferUsages::VERTEX,
+            }
+        );
+
+        let depth_texture = texture::Texture::create_depth_texture(&device, &config, "depth_texture");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
@@ -443,6 +551,7 @@ impl<'a> State<'a> {
                 entry_point: "vs_main",
                 buffers: &[
                     Vertex::desc(),
+                    InstanceRaw::desc(),
                 ],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
@@ -468,7 +577,13 @@ impl<'a> State<'a> {
                 // requires Features::CONSERVATIVE_RASTERIZATION
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: texture::Texture::DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -498,7 +613,6 @@ impl<'a> State<'a> {
 
         let staging_buffer = wgpu::util::StagingBelt::new((2 * std::mem::size_of::<AngleUniform>()) as wgpu::BufferAddress);
 
-
         Self {
             surface,
             device,
@@ -511,6 +625,7 @@ impl<'a> State<'a> {
             num_indices,
             diffuse_bind_group,
             diffuse_texture,
+            depth_texture,
 
             camera,
             camera_controller,
@@ -524,6 +639,9 @@ impl<'a> State<'a> {
             angle_bind_group,
 
             staging_buffer,
+
+            instances,
+            instance_buffer,
 
             window,
         }
@@ -539,6 +657,7 @@ impl<'a> State<'a> {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            self.depth_texture = texture::Texture::create_depth_texture(&self.device, &self.config, "depth_texture");
         }
     }
 
@@ -551,11 +670,12 @@ impl<'a> State<'a> {
         self.camera_uniform.update_view_proj(&self.camera);
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
 
-        self.angle += 2.0;
+        self.angle += 1.5;
         self.angle_uniform.update_angle(self.angle);
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+
         let output = self.surface.get_current_texture()?;
 
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -579,7 +699,14 @@ impl<'a> State<'a> {
                     store: wgpu::StoreOp::Store,
                 },
             })],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_texture.view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
             occlusion_query_set: None,
             timestamp_writes: None,
         });
@@ -601,9 +728,10 @@ impl<'a> State<'a> {
         self.staging_buffer.finish();
 
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
         render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
 
-        render_pass.draw_indexed(0..self.num_indices, 0, 0..1);
+        render_pass.draw_indexed(0..self.num_indices, 0, 0..self.instances.len() as _);
 
         drop(render_pass);
 
